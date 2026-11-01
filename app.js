@@ -31,6 +31,13 @@
       ],
     },
     {
+      name: '色彩分级',
+      items: [
+        { k: 'shadowTint', label: '阴影色调', step: 1, dec: 0, zero: 0 },
+        { k: 'highlightTint', label: '高光色调', step: 1, dec: 0, zero: 0 },
+      ],
+    },
+    {
       name: '细节',
       items: [
         { k: 'clarity', label: '清晰度', step: 1, dec: 0, zero: 0 },
@@ -93,7 +100,8 @@
   uniform int   uBefore;
 
   uniform float uEv, uContrast, uHighlights, uShadows, uMidtone,
-                uTemp, uTint, uSat, uVib, uClarity, uDenoise, uSharpen, uNoise;
+                uTemp, uTint, uShadowTint, uHighlightTint,
+                uSat, uVib, uClarity, uDenoise, uSharpen, uNoise, uWhite;
 
   const vec3 LW = vec3(0.2126, 0.7152, 0.0722);
   float luma(vec3 c) { return dot(c, LW); }
@@ -146,6 +154,10 @@
     lin.r *= 1.0 + 0.30 * uTemp + 0.05 * uTint;
     lin.b *= 1.0 - 0.30 * uTemp + 0.05 * uTint;
     lin.g *= 1.0 - 0.16 * uTint;
+    /* 高光肩部：darktable sigmoid 的扩展 Reinhard（中灰不变，白点平滑渐进到 1） */
+    if (uWhite > 0.0001) {
+      lin = lin * (1.0 + lin / (uWhite * uWhite)) / (1.0 + lin);
+    }
     c = toDisp(lin);
 
     /* --- 3. 阴影 / 高光 --- */
@@ -183,7 +195,18 @@
       c += uClarity * 1.05 * (0.55 * fine + 0.50 * broad);
     }
 
-    /* --- 7. 饱和度 / 鲜艳度（肤色保护）--- */
+    /* --- 7. 色彩分级：阴影/高光分离色调（color balance rgb）--- */
+    if (abs(uShadowTint) > 0.0001 || abs(uHighlightTint) > 0.0001) {
+      float Yg = luma(c);
+      float ws = 1.0 - smoothstep(0.02, 0.55, Yg);
+      float wh = smoothstep(0.45, 1.0, Yg);
+      float g = uShadowTint * ws + uHighlightTint * wh;
+      c.r *= 1.0 + 0.14 * g;
+      c.b *= 1.0 - 0.14 * g;
+      c.g *= 1.0 + 0.02 * g;
+    }
+
+    /* --- 8. 饱和度 / 鲜艳度（肤色保护）--- */
     if (abs(uSat) > 0.0001 || abs(uVib) > 0.0001) {
       float Y = luma(c);
       float mx = max(c.r, max(c.g, c.b));
@@ -196,7 +219,7 @@
       c = vec3(Y) + (c - vec3(Y)) * max(gain, 0.0);
     }
 
-    /* --- 8. 锐化 --- */
+    /* --- 9. 锐化 --- */
     if (uSharpen > 0.0001) {
       vec3 bs = textureLod(uTex, vUV, 0.75).rgb;
       float d = clamp(luma(c) - luma(bs), -0.12, 0.12);
@@ -254,7 +277,8 @@
     gl.u = {};
     ['uZoom', 'uPan', 'uTex', 'uTexSize', 'uTexel', 'uSplit', 'uBefore', 'uEv',
       'uContrast', 'uHighlights', 'uShadows', 'uMidtone', 'uTemp', 'uTint',
-      'uSat', 'uVib', 'uClarity', 'uDenoise', 'uSharpen', 'uNoise']
+      'uShadowTint', 'uHighlightTint',
+      'uSat', 'uVib', 'uClarity', 'uDenoise', 'uSharpen', 'uNoise', 'uWhite']
       .forEach((n) => { gl.u[n] = ctx.getUniformLocation(p, n); });
 
     gl.tex = ctx.createTexture();
@@ -335,12 +359,15 @@
     ctx.uniform1f(gl.u.uMidtone, (p.midtone || 0) / 100);
     ctx.uniform1f(gl.u.uTemp, (p.temp || 0) / 100);
     ctx.uniform1f(gl.u.uTint, (p.tint || 0) / 100);
+    ctx.uniform1f(gl.u.uShadowTint, (p.shadowTint || 0) / 100);
+    ctx.uniform1f(gl.u.uHighlightTint, (p.highlightTint || 0) / 100);
     ctx.uniform1f(gl.u.uSat, (p.saturation || 0) / 100);
     ctx.uniform1f(gl.u.uVib, (p.vibrance || 0) / 100);
     ctx.uniform1f(gl.u.uClarity, (p.clarity || 0) / 100);
     ctx.uniform1f(gl.u.uDenoise, (p.denoise || 0) / 100);
     ctx.uniform1f(gl.u.uSharpen, (p.sharpen || 0) / 100);
     ctx.uniform1f(gl.u.uNoise, currentImage().analysis?.noiseSigma || 0.005);
+    ctx.uniform1f(gl.u.uWhite, currentImage().analysis?.whiteLin ?? 1);
 
     ctx.drawArrays(ctx.TRIANGLE_STRIP, 0, 4);
 
@@ -389,10 +416,13 @@
 
     const e = img.exif;
     const chips = [
+      img.engine === 'darktable' ? 'darktable 显影' : '原生显影',
       e.camera, e.lens !== '—' ? e.lens : null,
       e.iso ? `ISO ${e.iso}` : null, e.shutter, e.aperture, e.focal,
     ].filter(Boolean);
     $('#edExif').innerHTML = chips.map((c) => `<span>${c}</span>`).join('');
+    $('#tagBefore').textContent = img.engine === 'darktable' ? 'darktable 默认显影' : 'RAW 原片';
+    $('#tagAfter').textContent = 'xPhoto 修图';
 
     buildPresets();
     buildSliders();
@@ -502,6 +532,7 @@
     ev: [-2, 2], contrast: [-60, 80], highlights: [-80, 40], shadows: [-40, 80],
     midtone: [-50, 50], temp: [-30, 30], tint: [-30, 30], saturation: [-60, 60],
     vibrance: [-40, 60], clarity: [-40, 60], denoise: [0, 100], sharpen: [0, 100],
+    shadowTint: [-40, 40], highlightTint: [-40, 40],
   }[k] || [0, 100]);
 
   function slotOf(k) {
@@ -731,12 +762,15 @@
     ctx.uniform1f(gl.u.uMidtone, (p.midtone || 0) / 100);
     ctx.uniform1f(gl.u.uTemp, (p.temp || 0) / 100);
     ctx.uniform1f(gl.u.uTint, (p.tint || 0) / 100);
+    ctx.uniform1f(gl.u.uShadowTint, (p.shadowTint || 0) / 100);
+    ctx.uniform1f(gl.u.uHighlightTint, (p.highlightTint || 0) / 100);
     ctx.uniform1f(gl.u.uSat, (p.saturation || 0) / 100);
     ctx.uniform1f(gl.u.uVib, (p.vibrance || 0) / 100);
     ctx.uniform1f(gl.u.uClarity, (p.clarity || 0) / 100);
     ctx.uniform1f(gl.u.uDenoise, (p.denoise || 0) / 100);
     ctx.uniform1f(gl.u.uSharpen, (p.sharpen || 0) / 100);
     ctx.uniform1f(gl.u.uNoise, img.analysis?.noiseSigma || 0.005);
+    ctx.uniform1f(gl.u.uWhite, img.analysis?.whiteLin ?? 1);
     ctx.drawArrays(ctx.TRIANGLE_STRIP, 0, 4);
 
     const blob = await new Promise((res) => canvas.toBlob(res, 'image/jpeg', 0.95));
@@ -788,10 +822,13 @@
 
     const total = state.manifest.images.length;
     const size = state.manifest.images[0];
+    const engName = state.manifest.engine === 'darktable' ? 'darktable'
+      : state.manifest.engine === 'mixed' ? '混合' : '原生';
     $('#galleryStats').innerHTML = `
       <div><b>${total}</b><span>张 RAW</span></div>
       <div><b>${Math.round(state.manifest.processMs / 100) / 10}s</b><span>处理耗时</span></div>
-      <div><b>${size ? size.width + '×' + size.height : '—'}</b><span>分辨率</span></div>`;
+      <div><b>${size ? size.width + '×' + size.height : '—'}</b><span>分辨率</span></div>
+      <div><b>${engName}</b><span>显影引擎</span></div>`;
   }
 
   /* ---------------- toast ---------------- */

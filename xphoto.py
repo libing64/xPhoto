@@ -26,7 +26,9 @@ import argparse
 import json
 import math
 import os
+import shutil
 import struct
+import subprocess
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor
@@ -34,7 +36,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from PIL import Image
-from scipy.ndimage import uniform_filter
+from scipy.ndimage import correlate1d, uniform_filter
 
 try:
     import rawpy
@@ -47,6 +49,7 @@ EPS = 1e-6
 # 参数体系（与 web/app.js 中的 shader 完全一致，单位都是"百分比"或 EV）
 PARAM_KEYS = [
     "ev", "contrast", "highlights", "shadows", "midtone", "temp", "tint",
+    "shadowTint", "highlightTint",
     "saturation", "vibrance", "clarity", "denoise", "sharpen",
 ]
 
@@ -58,6 +61,8 @@ PARAM_RANGE = {
     "midtone": (-50, 50),
     "temp": (-30, 30),
     "tint": (-30, 30),
+    "shadowTint": (-40, 40),
+    "highlightTint": (-40, 40),
     "saturation": (-60, 60),
     "vibrance": (-40, 60),
     "clarity": (-40, 60),
@@ -107,7 +112,10 @@ def box_blur(img: np.ndarray, radius: int, passes: int = 3) -> np.ndarray:
 
 
 def guided_filter(guide: np.ndarray, src: np.ndarray, radius: int, eps: float) -> np.ndarray:
-    """引导滤波：以 guide 的结构去平滑 src，边缘保持。"""
+    """引导滤波：以 guide 的结构去平滑 src，边缘保持。
+
+    目前主链改用 à trous 小波，这个保留给自定义调参时做局部色调映射用。
+    """
     r = max(1, int(radius))
     size = 2 * r + 1
     mI = uniform_filter(guide, size, mode="reflect")
@@ -330,6 +338,8 @@ def auto_balance(st: Dict[str, float]) -> Dict[str, float]:
         "midtone": round(midtone, 1),
         "temp": round(temp, 1),
         "tint": round(tint, 1),
+        "shadowTint": 0.0,
+        "highlightTint": 0.0,
         "saturation": round(saturation, 1),
         "vibrance": round(vibrance, 1),
         "clarity": round(clarity, 1),
@@ -364,6 +374,8 @@ def preset_variants(base: Dict[str, float]) -> Dict[str, Dict[str, float]]:
         "clarity": clamp(base["clarity"] + 18, -40, 60),
         "sharpen": clamp(base["sharpen"] + 14, 0, 100),
         "temp": clamp(base["temp"] + 2, -30, 30),
+        "shadowTint": -7,
+        "highlightTint": 9,
     })
     film = dict(base)
     film.update({
@@ -378,53 +390,158 @@ def preset_variants(base: Dict[str, float]) -> Dict[str, Dict[str, float]]:
         "tint": clamp(base["tint"] + 2, -30, 30),
         "ev": clamp(base["ev"] + 0.06, -2, 2),
         "denoise": clamp(base["denoise"] + 8, 0, 100),
+        "shadowTint": 5,
+        "highlightTint": -4,
     })
     return {"natural": natural, "vivid": vivid, "film": film}
 
 
 # --------------------------------------------------------------------------
-# 降噪
+# 降噪：à trous 小波（与 darktable 的 profiled denoise 同一套原理）
 # --------------------------------------------------------------------------
+B3_SPLINE = np.array([1, 4, 6, 4, 1], dtype=np.float32) / 16.0
+# B3 核的能量：Σkᵢ² = 70/256，白噪声经一级低通后方差衰减到 0.273 倍，
+# 因此第 k 级细节带的标准差系数依次为 0.852 / 0.446 / 0.233 / 0.122
+SCALE_SIGMA = (0.852, 0.446, 0.233)
+
+
+def _atrous_blur(img: np.ndarray, step: int) -> np.ndarray:
+    """à trous（带孔）B3 样条低通：核固定、间距随尺度翻倍。"""
+    k = np.zeros(4 * step + 1, dtype=np.float32)
+    k[::step] = B3_SPLINE
+    out = correlate1d(img, k, axis=0, mode="nearest")
+    return correlate1d(out, k, axis=1, mode="nearest")
+
+
+def wavelet_denoise_plane(plane: np.ndarray, sigma: float, strength: float,
+                          chroma: bool = False) -> np.ndarray:
+    """
+    软阈值小波降噪。strength: 0..1。
+    色度通道阈值放大：人眼对色度噪声宽容，对色度细节不敏感。
+    """
+    if strength <= 0.02 or sigma <= 0:
+        return plane
+    tf = (0.55 + 1.85 * strength) * (2.4 if chroma else 1.0)
+    out = np.zeros_like(plane)
+    cur = plane
+    for i, step in enumerate((1, 2, 4)):
+        low = _atrous_blur(cur, step)
+        detail = cur - low
+        thr = SCALE_SIGMA[i] * sigma * tf
+        absd = np.abs(detail)
+        absd -= thr
+        np.maximum(absd, 0.0, out=absd)
+        # 软阈值保留符号，避免硬阈值的"塑料感"
+        np.copysign(absd, detail, out=absd)
+        out += absd
+        cur = low
+        del low, detail
+    out += cur
+    return out
+
+
 def denoise_linear(lin: np.ndarray, sigma: float, strength: float) -> np.ndarray:
-    """亮度 + 色度分离的引导滤波降噪（边缘保持）。strength: 0..1"""
+    """亮度 + 色度分离的小波降噪（对应 darktable profiled denoise 的 wavelet 模式）。"""
     if strength <= 0.02:
         return lin
     Y = luma(lin)
-    chroma = [lin[..., 2] - Y, lin[..., 0] - Y]  # Cb, Cr 的简易近似
+    cb = lin[..., 2] - Y
+    cr = lin[..., 0] - Y
 
-    # 亮度：半径随强度走，eps 随噪声方差走
-    eps = (sigma * 2.4) ** 2 + 1e-6
-    Y_dn = guided_filter(Y, Y, radius=2, eps=eps)
-    Y_out = Y + (Y_dn - Y) * (0.95 * strength ** 1.3)
-
-    # 色度：大力平滑（人眼对色度噪声更敏感、对色度细节不敏感）
-    eps_c = (0.05 ** 2) * 1.0
-    cr_radius = 2 + int(round(4 * strength))
-    cb_out = guided_filter(Y, chroma[0], radius=cr_radius, eps=eps_c)
-    cr_out = guided_filter(Y, chroma[1], radius=cr_radius, eps=eps_c)
-    k = 0.95 * strength
+    Y_out = wavelet_denoise_plane(Y, sigma, strength, chroma=False)
+    cb = wavelet_denoise_plane(cb, sigma, strength, chroma=True)
+    cr = wavelet_denoise_plane(cr, sigma, strength, chroma=True)
 
     out = np.empty_like(lin)
-    B = Y_out + (chroma[0] + (cb_out - chroma[0]) * k)
-    R = Y_out + (chroma[1] + (cr_out - chroma[1]) * k)
-    # G 由 Y 与 R/B 反解，保持亮度不变
+    B = Y_out + cb
+    R = Y_out + cr
     G = (Y_out - LUMA_W[0] * R - LUMA_W[2] * B) / LUMA_W[1]
     out[..., 0] = R
-    out[..., 2] = B
     out[..., 1] = G
+    out[..., 2] = B
     return np.clip(out, 0.0, 1.2)
+
+
+def highlight_rolloff(lin: np.ndarray, white: float) -> np.ndarray:
+    """
+    darktable sigmoid / filmic 的肩部：扩展 Reinhard。
+    中灰 0.18 保持不变，white 点映射到 1.0，以上部分平滑渐进到 1.0 而不硬切。
+    """
+    w = max(white, 0.25)
+    return lin * (1.0 + lin / (w * w)) / (1.0 + lin)
+
+
+# --------------------------------------------------------------------------
+# darktable 后端：把 RAW 显影交给 darktable，我们只做自动调色
+# --------------------------------------------------------------------------
+DT_CANDIDATES = (
+    "/usr/bin/darktable-cli",
+    "/usr/local/bin/darktable-cli",
+    "/snap/bin/darktable-cli",
+    "/var/lib/flatpak/exports/bin/org.darktable.Darktable",
+    "/app/bin/darktable-cli",
+)
+
+
+def find_darktable(explicit: Optional[str] = None) -> Optional[str]:
+    """按显式路径 → 环境变量 → PATH → 常见安装位置 的顺序找 darktable-cli。"""
+    for c in (explicit, os.environ.get("DARKTABLE_CLI")):
+        if c and os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    w = shutil.which("darktable-cli")
+    if w:
+        return w
+    for c in DT_CANDIDATES:
+        if os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    return None
+
+
+def darktable_develop(raw_path: str, out_path: str, long_edge: int, dt_bin: str,
+                      style: Optional[str] = None, timeout: int = 300) -> bool:
+    """
+    调 darktable-cli 用它的默认场景参照（scene-referred）管线显影一张底片：
+    自带去马赛克、镜头校正、相机噪声配置文件降噪、sigmoid 色调映射。
+    产出 8bit sRGB JPEG，交给后续的自动调色。
+
+    不写 XMP：darktable 的模块参数是二进制结构体，跨版本手写极易出错，
+    这里只要求"一份高质量的默认显影"，风格调整仍由 xphoto 负责。
+    """
+    cmd = [
+        dt_bin, raw_path, out_path,
+        "--core", "--hq", "true", "--bpp", "8",
+    ]
+    if long_edge:
+        cmd += ["--width", str(long_edge), "--height", str(long_edge)]
+    if style:
+        cmd += ["--style", style]
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=timeout)
+    except (subprocess.SubprocessError, OSError) as e:
+        print(f"    ! darktable 调用失败：{e}", flush=True)
+        return False
+    if r.returncode != 0 or not os.path.exists(out_path) or os.path.getsize(out_path) < 1024:
+        tail = (r.stderr or b"").decode("utf-8", "ignore").strip().splitlines()[-3:]
+        print(f"    ! darktable 返回 {r.returncode}：{' / '.join(tail)}", flush=True)
+        return False
+    return True
+
+
+def load_display(path: str) -> np.ndarray:
+    return np.asarray(Image.open(path).convert("RGB"), dtype=np.float32) / 255.0
 
 
 # --------------------------------------------------------------------------
 # 渲染（与 web/app.js 的 GLSL 公式一一对应）
 # --------------------------------------------------------------------------
-def render(neutral_disp: np.ndarray, prm: Dict[str, float], sigma: float) -> np.ndarray:
+def render(neutral_disp: np.ndarray, prm: Dict[str, float], sigma: float,
+           white: float = 1.0) -> np.ndarray:
     den = float(prm.get("denoise", 0)) / 100.0
     p = neutral_disp
     if den > 0.02:
         p = to_display(denoise_linear(to_linear(p), sigma, den))
 
-    # ---- 曝光 / 白平衡（伪线性域）----
+    # ---- 曝光 / 白平衡 / 高光滑架（线性域）----
     lin = to_linear(p)
     lin *= np.float32(2.0 ** float(prm.get("ev", 0.0)))
     t = float(prm.get("temp", 0)) / 100.0
@@ -432,6 +549,8 @@ def render(neutral_disp: np.ndarray, prm: Dict[str, float], sigma: float) -> np.
     lin[..., 0] *= (1.0 + 0.30 * t + 0.05 * ti)
     lin[..., 2] *= (1.0 - 0.30 * t + 0.05 * ti)
     lin[..., 1] *= (1.0 - 0.16 * ti)
+    if white > 0:
+        lin = highlight_rolloff(lin, white)
     p = to_display(lin)
 
     L = luma(p)
@@ -471,6 +590,18 @@ def render(neutral_disp: np.ndarray, prm: Dict[str, float], sigma: float) -> np.
         fine = np.clip(Y - box_blur(Y, max(2, short // 420), 2), -0.18, 0.18)
         broad = np.clip(Y - box_blur(Y, max(4, short // 42), 3), -0.25, 0.25)
         p = p + (cl * 1.05 * (0.55 * fine + 0.50 * broad))[..., None]
+
+    # ---- 色彩分级（color balance rgb：阴影/高光分离色调）----
+    st_amt = float(prm.get("shadowTint", 0)) / 100.0
+    ht_amt = float(prm.get("highlightTint", 0)) / 100.0
+    if abs(st_amt) > 1e-3 or abs(ht_amt) > 1e-3:
+        Y = luma(p)
+        ws = (1.0 - smoothstep(0.02, 0.55, Y))
+        wh = smoothstep(0.45, 1.0, Y)
+        g = st_amt * ws + ht_amt * wh
+        p[..., 0] *= (1.0 + 0.14 * g)
+        p[..., 2] *= (1.0 - 0.14 * g)
+        p[..., 1] *= (1.0 + 0.02 * g)
 
     # ---- 饱和度 / 鲜艳度（肤色保护）----
     sat_amt = float(prm.get("saturation", 0)) / 100.0
@@ -522,15 +653,39 @@ def resize_long_edge(arr: np.ndarray, long_edge: int) -> np.ndarray:
 # --------------------------------------------------------------------------
 # 单张处理
 # --------------------------------------------------------------------------
-def process_one(args: Tuple[str, str, int, int]) -> Dict[str, Any]:
-    path, out_root, preview_size, thumb_size = args
+def process_one(args: Tuple[str, str, int, int, str, Optional[str], Optional[str]]) -> Dict[str, Any]:
+    path, out_root, preview_size, thumb_size, engine, dt_bin, dt_style = args
     t0 = time.time()
     name = os.path.splitext(os.path.basename(path))[0]
     exif = read_exif(path)
+    d = os.path.join(out_root, name)
+    os.makedirs(d, exist_ok=True)
 
-    lin, gain = normalize_white(decode_raw(path))
-    neutral_disp = np.clip(to_display(lin), 0.0, 1.0)
-    sigma = estimate_noise(lin)
+    # ---- 底片：darktable 显影 或 自带流线性解码 ----
+    used_engine = "native"
+    gain = 1.0
+    white_lin = 1.0
+    if engine in ("auto", "darktable") and dt_bin:
+        dt_out = os.path.join(d, "dt_base.jpg")
+        if darktable_develop(path, dt_out, 0, dt_bin, dt_style):
+            neutral_disp = load_display(dt_out)
+            used_engine = "darktable"
+            sigma = estimate_noise(to_linear(neutral_disp)) * 0.55
+        else:
+            neutral_disp = None
+    else:
+        neutral_disp = None
+
+    if neutral_disp is None:
+        lin, gain = normalize_white(decode_raw(path))
+        neutral_disp = np.clip(to_display(lin), 0.0, 1.0)
+        sigma = estimate_noise(lin)
+        try:
+            white_lin = float(np.percentile(luma(lin)[::3, ::3], 99.9))
+        except (IndexError, ValueError):
+            white_lin = 1.0
+        white_lin = clamp(white_lin, 0.2, 8.0)
+
     st = scene_stats(neutral_disp)
 
     try:
@@ -540,16 +695,17 @@ def process_one(args: Tuple[str, str, int, int]) -> Dict[str, Any]:
 
     base = auto_balance(st)
     base.update(auto_detail(sigma, iso))
+    if used_engine == "darktable":
+        # darktable 已经用相机噪声配置文件做过降噪，这边只需补一点
+        base["denoise"] = round(clamp(base["denoise"] * 0.35, 0.0, 30.0), 1)
     presets = preset_variants(base)
     natural = presets["natural"]
 
-    full = render(neutral_disp, natural, sigma)
+    full = render(neutral_disp, natural, sigma, white_lin)
     preview_in = resize_long_edge(neutral_disp, preview_size)
     neutral_prev = preview_in
     auto_prev = resize_long_edge(full, preview_size)
 
-    d = os.path.join(out_root, name)
-    os.makedirs(d, exist_ok=True)
     save_jpeg(neutral_prev, os.path.join(d, "neutral.jpg"), 90)
     save_jpeg(auto_prev, os.path.join(d, "auto.jpg"), 90)
     save_jpeg(resize_long_edge(full, thumb_size), os.path.join(d, "thumb.jpg"), 84)
@@ -563,6 +719,7 @@ def process_one(args: Tuple[str, str, int, int]) -> Dict[str, Any]:
         "file": os.path.basename(path),
         "width": w,
         "height": h,
+        "engine": used_engine,
         "exif": {
             "camera": " ".join(x for x in [str(exif.get("make", "")), str(exif.get("model", ""))] if x) or "未知相机",
             "lens": str(exif.get("lens", "") or "—"),
@@ -579,6 +736,7 @@ def process_one(args: Tuple[str, str, int, int]) -> Dict[str, Any]:
             "clipped": round(st["clipped"], 4),
             "crushed": round(st["crushed"], 4),
             "whiteGain": round(gain, 3),
+            "whiteLin": round(white_lin, 3),
             "medianBefore": round(st["p50"], 3),
             "medianAfter": round(after_stats["p50"], 3),
             "contrastBefore": round(st["p90"] - st["p10"], 3),
@@ -613,11 +771,25 @@ def main() -> int:
     ap.add_argument("--thumb", type=int, default=560, help="缩略图长边")
     ap.add_argument("--jobs", type=int, default=min(4, (os.cpu_count() or 2)), help="并行进程数")
     ap.add_argument("--limit", type=int, default=0, help="只处理前 N 张（调试用）")
+    ap.add_argument("--engine", choices=["auto", "native", "darktable"], default="auto",
+                    help="显影引擎：auto=有 darktable 就用，native=自带流，darktable=强制")
+    ap.add_argument("--darktable", default=None, help="darktable-cli 路径（默认自动查找）")
+    ap.add_argument("--dt-style", default=None, help="传给 darktable-cli 的 --style 名称")
     a = ap.parse_args()
 
     if rawpy is None:
         print("缺少 rawpy：pip install rawpy", file=sys.stderr)
         return 1
+
+    dt_bin = find_darktable(a.darktable)
+    if a.engine == "darktable" and not dt_bin:
+        print("指定了 --engine darktable，但没找到 darktable-cli。\n"
+              "  装一个：sudo apt install darktable   （或 snap install darktable）\n"
+              "  或用 --darktable /path/to/darktable-cli 指定路径", file=sys.stderr)
+        return 1
+    if a.engine == "auto" and not dt_bin:
+        print("未检测到 darktable-cli，使用自带显影引擎（native）。\n"
+              "  想用 darktable 显影：sudo apt install darktable 后重跑，或 --engine darktable")
 
     files = sorted(
         os.path.join(a.input, f) for f in os.listdir(a.input)
@@ -630,19 +802,24 @@ def main() -> int:
         return 1
 
     os.makedirs(a.output, exist_ok=True)
-    print(f"发现 {len(files)} 个 RAW，开始处理 → {a.output}/")
+    eng = a.engine if (a.engine != "auto" or dt_bin) else "native"
+    print(f"发现 {len(files)} 个 RAW，开始处理 → {a.output}/  "
+          f"[引擎: {eng}{' @ ' + dt_bin if eng == 'darktable' else ''}]")
     t0 = time.time()
-    tasks = [(f, a.output, a.preview, a.thumb) for f in files]
+    tasks = [(f, a.output, a.preview, a.thumb, a.engine, dt_bin, a.dt_style) for f in files]
     # rawpy 内部启用 OpenMP，必须用 spawn/forkserver 避免死锁
     import multiprocessing as mp
     ctx = mp.get_context("spawn")
     with ProcessPoolExecutor(max_workers=max(1, a.jobs), mp_context=ctx) as ex:
         metas = list(ex.map(process_one, tasks))
 
+    used = sorted({m["engine"] for m in metas})
     manifest = {
         "generatedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
         "source": a.input,
-        "version": 1,
+        "version": 2,
+        "engine": used[0] if len(used) == 1 else "mixed",
+        "darktable": dt_bin if "darktable" in used else None,
         "presetOrder": ["natural", "vivid", "film"],
         "paramKeys": PARAM_KEYS,
         "paramRange": {k: list(v) for k, v in PARAM_RANGE.items()},
