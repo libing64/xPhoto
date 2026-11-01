@@ -1,0 +1,659 @@
+#!/usr/bin/env python3
+"""
+xPhoto — RAW 自动修图流水线
+============================
+
+一条命令把目录里的 RAW（.ARW/.DNG/.CR3...）自动修完并产出网页可以读取的素材：
+
+    python xphoto.py --input data --output out
+
+对每张照片依次执行：
+    1. LibRaw 解码（相机白平衡、sRGB 色彩矩阵、AHD 去马赛克）
+    2. 基础归一（黑/白点 + 高光余量归一，得到"平灰"的中性底片 neutral）
+    3. AI 场景分析（直方图分位、噪声 sigma、肤色占比、饱和度、过曝比例）
+    4. 自动曝光 / 白平衡微调 / 阴影提亮 / 高光回收 / S 曲线对比
+    5. 引导滤波降噪（亮度 + 色度分离，边缘保持）
+    6. 清晰度（局部对比）、鲜艳度（肤色保护）、锐化
+    7. 导出 neutral / auto / full / thumb 四套图 + manifest.json
+
+三套风格参数（自然 / 通透 / 胶片）会一并写入 manifest，网页端用同一套
+数学公式实时重算，因此网页上看到的默认效果 = 这里导出的 auto.jpg。
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import struct
+import sys
+import time
+from concurrent.futures import ProcessPoolExecutor
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+from PIL import Image
+from scipy.ndimage import uniform_filter
+
+try:
+    import rawpy
+except ImportError:  # pragma: no cover
+    rawpy = None
+
+LUMA_W = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
+EPS = 1e-6
+
+# 参数体系（与 web/app.js 中的 shader 完全一致，单位都是"百分比"或 EV）
+PARAM_KEYS = [
+    "ev", "contrast", "highlights", "shadows", "midtone", "temp", "tint",
+    "saturation", "vibrance", "clarity", "denoise", "sharpen",
+]
+
+PARAM_RANGE = {
+    "ev": (-2.0, 2.0),
+    "contrast": (-60, 80),
+    "highlights": (-80, 40),
+    "shadows": (-40, 80),
+    "midtone": (-50, 50),
+    "temp": (-30, 30),
+    "tint": (-30, 30),
+    "saturation": (-60, 60),
+    "vibrance": (-40, 60),
+    "clarity": (-40, 60),
+    "denoise": (0, 100),
+    "sharpen": (0, 100),
+}
+
+
+# --------------------------------------------------------------------------
+# 基础工具
+# --------------------------------------------------------------------------
+def clamp(v: float, lo: float, hi: float) -> float:
+    return lo if v < lo else hi if v > hi else v
+
+
+def luma(img: np.ndarray) -> np.ndarray:
+    return img[..., 0] * LUMA_W[0] + img[..., 1] * LUMA_W[1] + img[..., 2] * LUMA_W[2]
+
+
+def to_linear(x: np.ndarray) -> np.ndarray:
+    return np.power(np.clip(x, 0.0, 1.0), 2.2, dtype=np.float32)
+
+
+def to_display(x: np.ndarray) -> np.ndarray:
+    return np.power(np.clip(x, 0.0, 1.0), 1.0 / 2.2, dtype=np.float32)
+
+
+def smoothstep(e0: float, e1: float, x: np.ndarray) -> np.ndarray:
+    t = np.clip((x - e0) / (e1 - e0 + EPS), 0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
+
+
+def inv_smoothstep(p: np.ndarray) -> np.ndarray:
+    """smoothstep 的解析反函数，用来做"降对比"。"""
+    p = np.clip(p, 0.0, 1.0)
+    arg = np.clip(1.0 - 2.0 * p, -1.0, 1.0)
+    return np.clip(0.5 - np.sin(np.arcsin(arg) / 3.0), 0.0, 1.0)
+
+
+def box_blur(img: np.ndarray, radius: int, passes: int = 3) -> np.ndarray:
+    """多次盒滤波近似高斯，O(1)/像素。"""
+    r = max(1, int(radius))
+    out = img.astype(np.float32, copy=True)
+    for _ in range(passes):
+        out = uniform_filter(out, size=2 * r + 1, mode="reflect")
+    return out
+
+
+def guided_filter(guide: np.ndarray, src: np.ndarray, radius: int, eps: float) -> np.ndarray:
+    """引导滤波：以 guide 的结构去平滑 src，边缘保持。"""
+    r = max(1, int(radius))
+    size = 2 * r + 1
+    mI = uniform_filter(guide, size, mode="reflect")
+    mP = uniform_filter(src, size, mode="reflect")
+    corr_I = uniform_filter(guide * guide, size, mode="reflect")
+    corr_IP = uniform_filter(guide * src, size, mode="reflect")
+    varI = corr_I - mI * mI
+    covIP = corr_IP - mI * mP
+    a = covIP / (varI + eps)
+    b = mP - a * mI
+    return uniform_filter(a, size, mode="reflect") * guide + uniform_filter(b, size, mode="reflect")
+
+
+# --------------------------------------------------------------------------
+# EXIF（自己解析 TIFF IFD，不依赖 exiftool）
+# --------------------------------------------------------------------------
+_TAG_NAMES = {
+    0x010F: "make", 0x0110: "model", 0x0131: "software", 0x0132: "datetime",
+    0x829A: "exposure_time", 0x829D: "fnumber", 0x8827: "iso",
+    0x9003: "datetime_original", 0x920A: "focal_length", 0xA434: "lens",
+    0x9209: "flash", 0xA002: "pixel_x", 0xA003: "pixel_y",
+}
+
+_TYPE_SIZE = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 6: 1, 7: 1, 8: 2, 9: 4, 10: 8, 11: 4, 12: 8}
+
+
+def _read_ifd(data: bytes, bo: str, offset: int, out: Dict[str, Any], depth: int = 0) -> None:
+    if depth > 3 or offset <= 0 or offset + 2 > len(data):
+        return
+    try:
+        n = struct.unpack(bo + "H", data[offset: offset + 2])[0]
+    except struct.error:
+        return
+    if n > 500:
+        return
+    for i in range(n):
+        e = offset + 2 + i * 12
+        if e + 12 > len(data):
+            break
+        tag, typ, cnt = struct.unpack(bo + "HHI", data[e: e + 8])
+        if typ not in _TYPE_SIZE:
+            continue
+        total = _TYPE_SIZE[typ] * cnt
+        if total <= 4:
+            raw = data[e + 8: e + 8 + total]
+        else:
+            ptr = struct.unpack(bo + "I", data[e + 8: e + 12])[0]
+            if ptr + total > len(data):
+                continue
+            raw = data[ptr: ptr + total]
+        if tag in (0x8769, 0x014A, 0x8825):
+            ptr = struct.unpack(bo + "I", data[e + 8: e + 12])[0]
+            if tag == 0x014A:
+                for k in range(cnt):
+                    sub = struct.unpack(bo + "I", raw[k * 4: k * 4 + 4])[0]
+                    _read_ifd(data, bo, sub, out, depth + 1)
+            else:
+                _read_ifd(data, bo, ptr, out, depth + 1)
+            continue
+        name = _TAG_NAMES.get(tag)
+        if not name or name in out:
+            continue
+        try:
+            if typ == 2:
+                out[name] = raw.split(b"\x00")[0].decode("utf-8", "ignore").strip()
+            elif typ in (5, 10):
+                vals = []
+                for k in range(cnt):
+                    num, den = struct.unpack(bo + ("II" if typ == 5 else "ii"), raw[k * 8: k * 8 + 8])
+                    vals.append(num / den if den else 0.0)
+                out[name] = vals[0] if len(vals) == 1 else vals
+            elif typ in (3, 4, 8, 9):
+                fmt = {3: "H", 4: "I", 8: "h", 9: "i"}[typ]
+                vals = [struct.unpack(bo + fmt, raw[k * _TYPE_SIZE[typ]: (k + 1) * _TYPE_SIZE[typ]])[0]
+                        for k in range(cnt)]
+                out[name] = vals[0] if len(vals) == 1 else vals
+        except (struct.error, IndexError):
+            continue
+
+
+def read_exif(path: str) -> Dict[str, Any]:
+    try:
+        with open(path, "rb") as f:
+            data = f.read(512 * 1024)
+    except OSError:
+        return {}
+    if len(data) < 8 or data[:2] not in (b"II", b"MM"):
+        return {}
+    bo = "<" if data[:2] == b"II" else ">"
+    try:
+        ifd0 = struct.unpack(bo + "I", data[4:8])[0]
+    except struct.error:
+        return {}
+    raw: Dict[str, Any] = {}
+    _read_ifd(data, bo, ifd0, raw)
+    return raw
+
+
+def fmt_shutter(t: Any) -> str:
+    try:
+        t = float(t)
+    except (TypeError, ValueError):
+        return "—"
+    if t <= 0:
+        return "—"
+    if t >= 1:
+        return f"{t:g}s"
+    return f"1/{round(1 / t)}s"
+
+
+def fmt_focal(v: Any) -> str:
+    try:
+        return f"{float(v):.0f}mm"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def fmt_aperture(v: Any) -> str:
+    try:
+        return f"f/{float(v):g}"
+    except (TypeError, ValueError):
+        return "—"
+
+
+# --------------------------------------------------------------------------
+# 解码 + 归一
+# --------------------------------------------------------------------------
+def decode_raw(path: str) -> np.ndarray:
+    """返回线性 sRGB float32 (H,W,3)，1.0 ≈ 传感器饱和。"""
+    with rawpy.imread(path) as raw:
+        rgb = raw.postprocess(
+            use_camera_wb=True,
+            no_auto_bright=True,
+            output_color=rawpy.ColorSpace.sRGB,
+            gamma=(1, 1),
+            output_bps=16,
+            demosaic_algorithm=rawpy.DemosaicAlgorithm.AHD,
+            four_color_rgb=False,
+        )
+    return (rgb.astype(np.float32) / 65535.0)
+
+
+def normalize_white(lin: np.ndarray) -> Tuple[np.ndarray, float]:
+    """高光余量归一：让 99.5 分位亮度落在 0.9，避免欠曝底片过暗。"""
+    step = max(1, lin.shape[0] * lin.shape[1] // 400000)
+    sample = luma(lin)[::step, ::step]
+    p995 = float(np.percentile(sample, 99.5))
+    gain = clamp(0.90 / max(p995, 1e-4), 0.55, 6.0)
+    return lin * gain, gain
+
+
+def estimate_noise(lin: np.ndarray) -> float:
+    """用 MAD 估计线性域亮度噪声 sigma（高通残差的中位数绝对偏差）。"""
+    step = 2
+    y = luma(lin)[::step, ::step]
+    res = y - uniform_filter(y, size=5, mode="reflect")
+    mad = float(np.median(np.abs(res)))
+    sigma = 1.4826 * mad * 1.15
+    return max(sigma, 1e-4)
+
+
+def scene_stats(disp: np.ndarray) -> Dict[str, float]:
+    """在显示域（gamma 编码后）做直方图/色彩分析。"""
+    step = max(1, disp.shape[0] * disp.shape[1] // 600000)
+    small = disp[::step, ::step]
+    L = luma(small)
+    pcts = np.percentile(L, [1, 5, 10, 25, 50, 75, 90, 98, 99.5])
+    mx = small.max(axis=2)
+    mn = small.min(axis=2)
+    sat = (mx - mn) / np.maximum(mx, EPS)
+    r, g, b = small[..., 0], small[..., 1], small[..., 2]
+    hue = np.degrees(np.arctan2(np.sqrt(3.0) * (g - b), 2 * r - g - b))
+    hue = np.mod(hue, 360.0)
+    skin = (hue > 8) & (hue < 46) & (sat > 0.10) & (sat < 0.62) & (L > 0.16) & (L < 0.97)
+    return {
+        "p01": float(pcts[0]), "p05": float(pcts[1]), "p10": float(pcts[2]),
+        "p25": float(pcts[3]), "p50": float(pcts[4]), "p75": float(pcts[5]),
+        "p90": float(pcts[6]), "p98": float(pcts[7]), "p995": float(pcts[8]),
+        "clipped": float((L > 0.995).mean()),
+        "crushed": float((L < 0.02).mean()),
+        "sat_mean": float(sat.mean()),
+        "skin": float(skin.mean()),
+        "means": [float(small[..., i].mean()) for i in range(3)],
+    }
+
+
+# --------------------------------------------------------------------------
+# 自动参数
+# --------------------------------------------------------------------------
+def auto_balance(st: Dict[str, float]) -> Dict[str, float]:
+    """从场景统计反推一组保守的自然风格参数。"""
+    med = clamp(st["p50"], 0.05, 0.95)
+    # 死区：中位亮度落在 [0.36, 0.52] 时几乎不动，避免把正常曝光压暗/提亮过头
+    target = clamp(med, 0.36, 0.52)
+    ev = clamp(math.log2((target / med) ** 2.2) * 0.85, -0.55, 0.85)
+
+    # 白平衡：灰世界微调，只允许 ±10，避免毁掉暖调/日落
+    means = st["means"]
+    g_rb = math.log2(max(means[0], 1e-4) / max(means[2], 1e-4))
+    temp = clamp(-g_rb * 22.0, -8.0, 8.0)
+    tint = clamp((means[1] - (means[0] + means[2]) / 2) * 80.0, -6.0, 6.0)
+
+    shadows = clamp(4.0 + (0.27 - st["p25"]) * 145.0, 0.0, 46.0)
+    highlights = -clamp((st["p98"] - 0.90) * 200.0, 0.0, 38.0)
+    contrast = clamp(16.0 + (st["p90"] - st["p10"] - 0.42) * 42.0, 10.0, 27.0)
+    midtone = clamp(4.0 + (0.47 - med) * 90.0, -6.0, 20.0)
+
+    skin = st["skin"]
+    vibrance = 21.0 * (1.0 - min(skin * 1.8, 0.40))
+    # 黑场被"灰雾"抬起（隔着玻璃/雾霾）时，加大清晰度把层次拉回来
+    haze = clamp((st["p05"] - 0.10) * 78.0, 0.0, 24.0)
+    clarity = 13.0 * (1.0 - min(skin * 2.2, 0.55)) + haze
+    saturation = 3.0
+
+    return {
+        "ev": round(ev, 2),
+        "contrast": round(contrast, 1),
+        "highlights": round(highlights, 1),
+        "shadows": round(shadows, 1),
+        "midtone": round(midtone, 1),
+        "temp": round(temp, 1),
+        "tint": round(tint, 1),
+        "saturation": round(saturation, 1),
+        "vibrance": round(vibrance, 1),
+        "clarity": round(clarity, 1),
+        "denoise": 0.0,   # 由噪声估计填充
+        "sharpen": 0.0,
+    }
+
+
+def auto_detail(sigma: float, iso: float) -> Dict[str, float]:
+    # sigma 是线性域噪声；映射到 0-100 的去噪强度
+    d = clamp((sigma - 0.0010) * 2900.0, 6.0, 78.0)
+    if iso >= 3200:
+        d = max(d, clamp(45.0 + (iso - 3200) / 90.0, 45.0, 78.0))
+    elif iso >= 1600:
+        d = max(d, 38.0)
+    # 降噪后补偿一点锐化，找回 micro-contrast
+    sh = clamp(32.0 + d * 0.18 - 9.0 * clamp((iso - 1600) / 6000.0, 0, 1), 20.0, 46.0)
+    return {"denoise": round(d, 1), "sharpen": round(sh, 1)}
+
+
+def preset_variants(base: Dict[str, float]) -> Dict[str, Dict[str, float]]:
+    """三套风格：自然 / 通透 / 胶片。"""
+    natural = dict(base)
+    vivid = dict(base)
+    vivid.update({
+        "contrast": clamp(base["contrast"] + 12, -60, 80),
+        "highlights": clamp(base["highlights"] - 6, -80, 40),
+        "shadows": clamp(base["shadows"] + 4, -40, 80),
+        "midtone": clamp(base["midtone"] + 5, -50, 50),
+        "saturation": clamp(base["saturation"] + 8, -60, 60),
+        "vibrance": clamp(base["vibrance"] + 16, -40, 60),
+        "clarity": clamp(base["clarity"] + 18, -40, 60),
+        "sharpen": clamp(base["sharpen"] + 14, 0, 100),
+        "temp": clamp(base["temp"] + 2, -30, 30),
+    })
+    film = dict(base)
+    film.update({
+        "contrast": clamp(base["contrast"] - 9, -60, 80),
+        "highlights": clamp(base["highlights"] - 14, -80, 40),
+        "shadows": clamp(base["shadows"] + 22, -40, 80),
+        "midtone": clamp(base["midtone"] + 2, -50, 50),
+        "saturation": clamp(base["saturation"] - 12, -60, 60),
+        "vibrance": clamp(base["vibrance"] - 3, -40, 60),
+        "clarity": clamp(base["clarity"] - 4, -40, 60),
+        "temp": clamp(base["temp"] + 4, -30, 30),
+        "tint": clamp(base["tint"] + 2, -30, 30),
+        "ev": clamp(base["ev"] + 0.06, -2, 2),
+        "denoise": clamp(base["denoise"] + 8, 0, 100),
+    })
+    return {"natural": natural, "vivid": vivid, "film": film}
+
+
+# --------------------------------------------------------------------------
+# 降噪
+# --------------------------------------------------------------------------
+def denoise_linear(lin: np.ndarray, sigma: float, strength: float) -> np.ndarray:
+    """亮度 + 色度分离的引导滤波降噪（边缘保持）。strength: 0..1"""
+    if strength <= 0.02:
+        return lin
+    Y = luma(lin)
+    chroma = [lin[..., 2] - Y, lin[..., 0] - Y]  # Cb, Cr 的简易近似
+
+    # 亮度：半径随强度走，eps 随噪声方差走
+    eps = (sigma * 2.4) ** 2 + 1e-6
+    Y_dn = guided_filter(Y, Y, radius=2, eps=eps)
+    Y_out = Y + (Y_dn - Y) * (0.95 * strength ** 1.3)
+
+    # 色度：大力平滑（人眼对色度噪声更敏感、对色度细节不敏感）
+    eps_c = (0.05 ** 2) * 1.0
+    cr_radius = 2 + int(round(4 * strength))
+    cb_out = guided_filter(Y, chroma[0], radius=cr_radius, eps=eps_c)
+    cr_out = guided_filter(Y, chroma[1], radius=cr_radius, eps=eps_c)
+    k = 0.95 * strength
+
+    out = np.empty_like(lin)
+    B = Y_out + (chroma[0] + (cb_out - chroma[0]) * k)
+    R = Y_out + (chroma[1] + (cr_out - chroma[1]) * k)
+    # G 由 Y 与 R/B 反解，保持亮度不变
+    G = (Y_out - LUMA_W[0] * R - LUMA_W[2] * B) / LUMA_W[1]
+    out[..., 0] = R
+    out[..., 2] = B
+    out[..., 1] = G
+    return np.clip(out, 0.0, 1.2)
+
+
+# --------------------------------------------------------------------------
+# 渲染（与 web/app.js 的 GLSL 公式一一对应）
+# --------------------------------------------------------------------------
+def render(neutral_disp: np.ndarray, prm: Dict[str, float], sigma: float) -> np.ndarray:
+    den = float(prm.get("denoise", 0)) / 100.0
+    p = neutral_disp
+    if den > 0.02:
+        p = to_display(denoise_linear(to_linear(p), sigma, den))
+
+    # ---- 曝光 / 白平衡（伪线性域）----
+    lin = to_linear(p)
+    lin *= np.float32(2.0 ** float(prm.get("ev", 0.0)))
+    t = float(prm.get("temp", 0)) / 100.0
+    ti = float(prm.get("tint", 0)) / 100.0
+    lin[..., 0] *= (1.0 + 0.30 * t + 0.05 * ti)
+    lin[..., 2] *= (1.0 - 0.30 * t + 0.05 * ti)
+    lin[..., 1] *= (1.0 - 0.16 * ti)
+    p = to_display(lin)
+
+    L = luma(p)
+
+    # ---- 阴影提亮 / 高光回收 ----
+    sh = float(prm.get("shadows", 0)) / 100.0
+    if abs(sh) > 1e-3:
+        w = (1.0 - smoothstep(0.0, 0.58, L))[..., None]
+        p = p + sh * 0.30 * w * (1.0 - p)
+    hl = float(prm.get("highlights", 0)) / 100.0
+    if abs(hl) > 1e-3:
+        w = smoothstep(0.36, 0.96, L)[..., None]
+        p = p * (1.0 + hl * 0.34 * w)
+    p = np.clip(p, 0.0, 1.0)
+
+    # ---- 对比（S 曲线 / 反 S）----
+    c = float(prm.get("contrast", 0)) / 100.0
+    if abs(c) > 1e-3:
+        if c > 0:
+            p = p + (p * p * (3.0 - 2.0 * p) - p) * c
+        else:
+            p = p + (inv_smoothstep(p) - p) * (-c)
+
+    # ---- 中间调（钟形遮罩提亮/压暗，让主体跳出来）----
+    mt = float(prm.get("midtone", 0)) / 100.0
+    if abs(mt) > 1e-3:
+        Y = luma(p)
+        bell = 1.0 - np.abs(2.0 * Y - 1.0) ** 1.7
+        gain = 1.0 + mt * 0.42 * bell
+        p = p * gain[..., None]
+
+    # ---- 清晰度：双尺度局部对比（小半径=质感，大半径=去灰/通透）----
+    cl = float(prm.get("clarity", 0)) / 100.0
+    if abs(cl) > 1e-3:
+        Y = luma(p)
+        short = min(p.shape[0], p.shape[1])
+        fine = np.clip(Y - box_blur(Y, max(2, short // 420), 2), -0.18, 0.18)
+        broad = np.clip(Y - box_blur(Y, max(4, short // 42), 3), -0.25, 0.25)
+        p = p + (cl * 1.05 * (0.55 * fine + 0.50 * broad))[..., None]
+
+    # ---- 饱和度 / 鲜艳度（肤色保护）----
+    sat_amt = float(prm.get("saturation", 0)) / 100.0
+    vib_amt = float(prm.get("vibrance", 0)) / 100.0
+    if abs(sat_amt) > 1e-3 or abs(vib_amt) > 1e-3:
+        Y = luma(p)[..., None]
+        mx = p.max(axis=2)
+        mn = p.min(axis=2)
+        s = (mx - mn) / np.maximum(mx, EPS)
+        r, g, b = p[..., 0], p[..., 1], p[..., 2]
+        hue = np.mod(np.degrees(np.arctan2(np.sqrt(3.0) * (g - b), 2 * r - g - b)), 360.0)
+        skin_mask = ((hue > 8) & (hue < 46) & (s > 0.1) & (s < 0.7))
+        skin_w = (1.0 - 0.6 * skin_mask.astype(np.float32)).astype(np.float32)
+        del r, g, b, hue, skin_mask
+        gain = 1.0 + sat_amt + vib_amt * (1.0 - s) * 0.95 * skin_w
+        del skin_w
+        gain = np.maximum(gain, 0.0).astype(np.float32)
+        p = Y + (p - Y) * gain[..., None]
+
+    # ---- 锐化（非锐化掩膜，带光晕钳制）----
+    sp = float(prm.get("sharpen", 0)) / 100.0
+    if sp > 1e-3:
+        Y = luma(p)
+        base = box_blur(Y, 1, passes=2)
+        detail = np.clip(Y - base, -0.12, 0.12)
+        p = p + (detail * sp * 1.1)[..., None]
+
+    return np.clip(p, 0.0, 1.0)
+
+
+# --------------------------------------------------------------------------
+# 导出
+# --------------------------------------------------------------------------
+def save_jpeg(arr: np.ndarray, path: str, quality: int = 92) -> None:
+    img = Image.fromarray((np.clip(arr, 0, 1) * 255.0 + 0.5).astype(np.uint8), mode="RGB")
+    img.save(path, "JPEG", quality=quality, subsampling=0, optimize=True)
+
+
+def resize_long_edge(arr: np.ndarray, long_edge: int) -> np.ndarray:
+    h, w = arr.shape[:2]
+    scale = long_edge / max(h, w)
+    if scale >= 1:
+        return arr
+    img = Image.fromarray((np.clip(arr, 0, 1) * 255.0 + 0.5).astype(np.uint8), mode="RGB")
+    img = img.resize((max(1, round(w * scale)), max(1, round(h * scale))), Image.LANCZOS)
+    return np.asarray(img, dtype=np.float32) / 255.0
+
+
+# --------------------------------------------------------------------------
+# 单张处理
+# --------------------------------------------------------------------------
+def process_one(args: Tuple[str, str, int, int]) -> Dict[str, Any]:
+    path, out_root, preview_size, thumb_size = args
+    t0 = time.time()
+    name = os.path.splitext(os.path.basename(path))[0]
+    exif = read_exif(path)
+
+    lin, gain = normalize_white(decode_raw(path))
+    neutral_disp = np.clip(to_display(lin), 0.0, 1.0)
+    sigma = estimate_noise(lin)
+    st = scene_stats(neutral_disp)
+
+    try:
+        iso = float(exif.get("iso", 0) or 0)
+    except (TypeError, ValueError):
+        iso = 0.0
+
+    base = auto_balance(st)
+    base.update(auto_detail(sigma, iso))
+    presets = preset_variants(base)
+    natural = presets["natural"]
+
+    full = render(neutral_disp, natural, sigma)
+    preview_in = resize_long_edge(neutral_disp, preview_size)
+    neutral_prev = preview_in
+    auto_prev = resize_long_edge(full, preview_size)
+
+    d = os.path.join(out_root, name)
+    os.makedirs(d, exist_ok=True)
+    save_jpeg(neutral_prev, os.path.join(d, "neutral.jpg"), 90)
+    save_jpeg(auto_prev, os.path.join(d, "auto.jpg"), 90)
+    save_jpeg(resize_long_edge(full, thumb_size), os.path.join(d, "thumb.jpg"), 84)
+    save_jpeg(full, os.path.join(d, "full.jpg"), 93)
+
+    after_stats = scene_stats(auto_prev)
+    h, w = full.shape[:2]
+
+    meta = {
+        "id": name,
+        "file": os.path.basename(path),
+        "width": w,
+        "height": h,
+        "exif": {
+            "camera": " ".join(x for x in [str(exif.get("make", "")), str(exif.get("model", ""))] if x) or "未知相机",
+            "lens": str(exif.get("lens", "") or "—"),
+            "iso": int(iso) if iso else None,
+            "shutter": fmt_shutter(exif.get("exposure_time")),
+            "aperture": fmt_aperture(exif.get("fnumber")),
+            "focal": fmt_focal(exif.get("focal_length")),
+            "date": str(exif.get("datetime_original") or exif.get("datetime") or "—"),
+        },
+        "analysis": {
+            "noiseSigma": round(sigma, 5),
+            "skinRatio": round(st["skin"], 3),
+            "satMean": round(st["sat_mean"], 3),
+            "clipped": round(st["clipped"], 4),
+            "crushed": round(st["crushed"], 4),
+            "whiteGain": round(gain, 3),
+            "medianBefore": round(st["p50"], 3),
+            "medianAfter": round(after_stats["p50"], 3),
+            "contrastBefore": round(st["p90"] - st["p10"], 3),
+            "contrastAfter": round(after_stats["p90"] - after_stats["p10"], 3),
+        },
+        "params": natural,
+        "presets": presets,
+        "paths": {
+            "neutral": f"{os.path.basename(out_root)}/{name}/neutral.jpg",
+            "auto": f"{os.path.basename(out_root)}/{name}/auto.jpg",
+            "thumb": f"{os.path.basename(out_root)}/{name}/thumb.jpg",
+            "full": f"{os.path.basename(out_root)}/{name}/full.jpg",
+        },
+        "procMs": int((time.time() - t0) * 1000),
+    }
+    print(f"  ✓ {name}  {w}x{h}  ISO{int(iso)}  噪声σ={sigma:.4f}  去噪{natural['denoise']:.0f}  "
+          f"{meta['procMs']}ms", flush=True)
+    return meta
+
+
+# --------------------------------------------------------------------------
+# 入口
+# --------------------------------------------------------------------------
+RAW_EXT = {".arw", ".srf", ".sr2", ".cr2", ".cr3", ".nef", ".dng", ".raf", ".orf", ".rw2", ".pef", ".srw"}
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="RAW 自动修图流水线")
+    ap.add_argument("--input", default="data", help="RAW 目录")
+    ap.add_argument("--output", default="out", help="输出目录")
+    ap.add_argument("--preview", type=int, default=2200, help="网页预览长边")
+    ap.add_argument("--thumb", type=int, default=560, help="缩略图长边")
+    ap.add_argument("--jobs", type=int, default=min(4, (os.cpu_count() or 2)), help="并行进程数")
+    ap.add_argument("--limit", type=int, default=0, help="只处理前 N 张（调试用）")
+    a = ap.parse_args()
+
+    if rawpy is None:
+        print("缺少 rawpy：pip install rawpy", file=sys.stderr)
+        return 1
+
+    files = sorted(
+        os.path.join(a.input, f) for f in os.listdir(a.input)
+        if os.path.splitext(f)[1].lower() in RAW_EXT
+    )
+    if a.limit:
+        files = files[: a.limit]
+    if not files:
+        print(f"{a.input} 里没有找到 RAW 文件", file=sys.stderr)
+        return 1
+
+    os.makedirs(a.output, exist_ok=True)
+    print(f"发现 {len(files)} 个 RAW，开始处理 → {a.output}/")
+    t0 = time.time()
+    tasks = [(f, a.output, a.preview, a.thumb) for f in files]
+    # rawpy 内部启用 OpenMP，必须用 spawn/forkserver 避免死锁
+    import multiprocessing as mp
+    ctx = mp.get_context("spawn")
+    with ProcessPoolExecutor(max_workers=max(1, a.jobs), mp_context=ctx) as ex:
+        metas = list(ex.map(process_one, tasks))
+
+    manifest = {
+        "generatedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "source": a.input,
+        "version": 1,
+        "presetOrder": ["natural", "vivid", "film"],
+        "paramKeys": PARAM_KEYS,
+        "paramRange": {k: list(v) for k, v in PARAM_RANGE.items()},
+        "processMs": int((time.time() - t0) * 1000),
+        "images": metas,
+    }
+    with open(os.path.join(a.output, "manifest.json"), "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=1)
+    print(f"完成：{len(metas)} 张，用时 {time.time() - t0:.1f}s → {a.output}/manifest.json")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
