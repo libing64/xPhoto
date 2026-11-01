@@ -601,6 +601,31 @@ input[type="range"]::-moz-range-thumb {
 }
 .stat-v em { font-style: normal; font-size: 10px; color: var(--muted); font-weight: 400; }
 .tiny { font-size: 10.5px; color: var(--muted); margin: 8px 0 0; line-height: 1.6; }
+.tiny code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  background: var(--surface-2);
+  border-radius: 4px;
+  padding: 1px 4px;
+}
+
+/* 已烘焙参数 */
+.baked { display: flex; flex-wrap: wrap; gap: 5px; }
+.baked span {
+  font-size: 10.5px;
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  border-radius: 5px;
+  padding: 3px 7px;
+  color: var(--ink-2);
+  font-variant-numeric: tabular-nums;
+}
+.baked span i {
+  font-style: normal;
+  color: var(--muted);
+  margin-right: 4px;
+}
+.baked .muted { border: none; background: none; padding-left: 0; color: var(--muted); }
 .btn + .btn.wide { margin-top: 7px; }
 
 /* 胶片条 */

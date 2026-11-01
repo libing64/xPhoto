@@ -3,26 +3,26 @@
 xPhoto — RAW 自动修图流水线
 ============================
 
-一条命令把目录里的 RAW（.ARW/.DNG/.CR3...）自动修完并产出网页可以读取的素材：
+一条命令把目录里的 RAW（.ARW/.DNG/.CR3...）自动修完，每张只产出一张全分辨率成品：
 
-    python xphoto.py --input data --output out
+    python xphoto.py --input data --output out     # → out/DSC07910.jpg ...
 
 对每张照片依次执行：
-    1. LibRaw 解码（相机白平衡、sRGB 色彩矩阵、AHD 去马赛克）
-    2. 基础归一（黑/白点 + 高光余量归一，得到"平灰"的中性底片 neutral）
-    3. AI 场景分析（直方图分位、噪声 sigma、肤色占比、饱和度、过曝比例）
-    4. 自动曝光 / 白平衡微调 / 阴影提亮 / 高光回收 / S 曲线对比
-    5. 引导滤波降噪（亮度 + 色度分离，边缘保持）
-    6. 清晰度（局部对比）、鲜艳度（肤色保护）、锐化
-    7. 导出 neutral / auto / full / thumb 四套图 + manifest.json
+    1. 显影（默认 darktable-cli，缺失时回退到 LibRaw 自带流）
+    2. 场景分析（直方图分位、噪声 sigma、肤色占比、饱和度、过曝比例）
+    3. 自动曝光 / 白平衡微调 / 阴影提亮 / 高光回收 / S 曲线对比 / 中间调
+    4. 小波降噪（亮度 + 色度分离）、色彩分级、清晰度、锐化
+    5. 导出 out/<同名>.jpg，并把 EXIF / 分析 / 已烘焙参数 / 相册小图写进 manifest.json
 
-三套风格参数（自然 / 通透 / 胶片）会一并写入 manifest，网页端用同一套
-数学公式实时重算，因此网页上看到的默认效果 = 这里导出的 auto.jpg。
+输出目录是平铺的，不建子目录、不留中性底片和缩略图文件。
+网页端用同一套公式在 GPU 上重算，滑块全零时的画面就等于磁盘上那张成品。
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
+import io
 import json
 import math
 import os
@@ -30,6 +30,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 from concurrent.futures import ProcessPoolExecutor
 from typing import Any, Dict, List, Optional, Tuple
@@ -360,40 +361,35 @@ def auto_detail(sigma: float, iso: float) -> Dict[str, float]:
     return {"denoise": round(d, 1), "sharpen": round(sh, 1)}
 
 
-def preset_variants(base: Dict[str, float]) -> Dict[str, Dict[str, float]]:
-    """三套风格：自然 / 通透 / 胶片。"""
-    natural = dict(base)
-    vivid = dict(base)
-    vivid.update({
-        "contrast": clamp(base["contrast"] + 12, -60, 80),
-        "highlights": clamp(base["highlights"] - 6, -80, 40),
-        "shadows": clamp(base["shadows"] + 4, -40, 80),
-        "midtone": clamp(base["midtone"] + 5, -50, 50),
-        "saturation": clamp(base["saturation"] + 8, -60, 60),
-        "vibrance": clamp(base["vibrance"] + 16, -40, 60),
-        "clarity": clamp(base["clarity"] + 18, -40, 60),
-        "sharpen": clamp(base["sharpen"] + 14, 0, 100),
-        "temp": clamp(base["temp"] + 2, -30, 30),
-        "shadowTint": -7,
-        "highlightTint": 9,
-    })
-    film = dict(base)
-    film.update({
-        "contrast": clamp(base["contrast"] - 9, -60, 80),
-        "highlights": clamp(base["highlights"] - 14, -80, 40),
-        "shadows": clamp(base["shadows"] + 22, -40, 80),
-        "midtone": clamp(base["midtone"] + 2, -50, 50),
-        "saturation": clamp(base["saturation"] - 12, -60, 60),
-        "vibrance": clamp(base["vibrance"] - 3, -40, 60),
-        "clarity": clamp(base["clarity"] - 4, -40, 60),
-        "temp": clamp(base["temp"] + 4, -30, 30),
-        "tint": clamp(base["tint"] + 2, -30, 30),
-        "ev": clamp(base["ev"] + 0.06, -2, 2),
-        "denoise": clamp(base["denoise"] + 8, 0, 100),
-        "shadowTint": 5,
-        "highlightTint": -4,
-    })
-    return {"natural": natural, "vivid": vivid, "film": film}
+def soften_for_develop(base: Dict[str, float]) -> Dict[str, float]:
+    """
+    darktable 显影出来的底片已经做过曝光补偿、色调映射和降噪，
+    这边的自动调色只做"轻推"，否则两层处理叠加会导致高光发灰、暗部糊死。
+    """
+    q = dict(base)
+    for k, f in (
+        ("ev", 0.55), ("contrast", 0.55), ("shadows", 0.6), ("highlights", 0.6),
+        ("midtone", 0.65), ("clarity", 0.55), ("vibrance", 0.85),
+        ("saturation", 0.85), ("temp", 0.7), ("tint", 0.7),
+    ):
+        q[k] = round(q[k] * f, 1)
+    q["denoise"] = round(min(q["denoise"] * 0.28, 18.0), 1)
+    q["sharpen"] = round(min(q["sharpen"] * 0.75, 30.0), 1)
+    return q
+
+
+def preview_data_uri(arr: np.ndarray, edge: int = 480, quality: int = 70) -> str:
+    """把成品压成一张小图塞进 manifest，供相册网格/胶片条直接显示，
+    这样输出目录里就只需要每张 RAW 一个 jpg。"""
+    h, w = arr.shape[:2]
+    scale = edge / max(h, w)
+    tw, th = max(1, round(w * scale)), max(1, round(h * scale))
+    img = Image.fromarray((np.clip(arr, 0, 1) * 255.0 + 0.5).astype(np.uint8), mode="RGB")
+    if scale < 1:
+        img = img.resize((tw, th), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, "JPEG", quality=quality, optimize=True, subsampling=2)
+    return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
 
 
 # --------------------------------------------------------------------------
@@ -500,21 +496,25 @@ def find_darktable(explicit: Optional[str] = None) -> Optional[str]:
 def darktable_develop(raw_path: str, out_path: str, long_edge: int, dt_bin: str,
                       style: Optional[str] = None, timeout: int = 300) -> bool:
     """
-    调 darktable-cli 用它的默认场景参照（scene-referred）管线显影一张底片：
-    自带去马赛克、镜头校正、相机噪声配置文件降噪、sigmoid 色调映射。
+    调 darktable-cli 用它的默认流水线显影一张底片：
+    自带去马赛克、镜头校正、相机噪声配置文件降噪、色调映射。
     产出 8bit sRGB JPEG，交给后续的自动调色。
 
     不写 XMP：darktable 的模块参数是二进制结构体，跨版本手写极易出错，
     这里只要求"一份高质量的默认显影"，风格调整仍由 xphoto 负责。
+
+    注意 4.6 的 CLI 形如 `darktable-cli <in> <out> [--hq true]`，
+    而且多个实例会争抢同一个 library.db（SQLite 锁），所以每个进程
+    用一个独立的 --configdir，否则并行时会直接 abort。
     """
-    cmd = [
-        dt_bin, raw_path, out_path,
-        "--core", "--hq", "true", "--bpp", "8",
-    ]
+    cmd = [dt_bin, raw_path, out_path, "--hq", "0" if long_edge and long_edge < 1200 else "true"]
     if long_edge:
         cmd += ["--width", str(long_edge), "--height", str(long_edge)]
     if style:
         cmd += ["--style", style]
+    cfg = os.path.join(tempfile.gettempdir(), f"xphoto_darktable_{os.getpid()}")
+    os.makedirs(cfg, exist_ok=True)
+    cmd += ["--core", "--configdir", cfg]
     try:
         r = subprocess.run(cmd, capture_output=True, timeout=timeout)
     except (subprocess.SubprocessError, OSError) as e:
@@ -653,28 +653,28 @@ def resize_long_edge(arr: np.ndarray, long_edge: int) -> np.ndarray:
 # --------------------------------------------------------------------------
 # 单张处理
 # --------------------------------------------------------------------------
-def process_one(args: Tuple[str, str, int, int, str, Optional[str], Optional[str]]) -> Dict[str, Any]:
-    path, out_root, preview_size, thumb_size, engine, dt_bin, dt_style = args
+def process_one(args: Tuple[str, str, str, Optional[str], Optional[str], int]) -> Dict[str, Any]:
+    path, out_root, engine, dt_bin, dt_style, quality = args
     t0 = time.time()
     name = os.path.splitext(os.path.basename(path))[0]
     exif = read_exif(path)
-    d = os.path.join(out_root, name)
-    os.makedirs(d, exist_ok=True)
+    out_path = os.path.join(out_root, name + ".jpg")
 
-    # ---- 底片：darktable 显影 或 自带流线性解码 ----
+    # ---- 底片：darktable 显影 或 自带线性解码 ----
     used_engine = "native"
     gain = 1.0
-    white_lin = 1.0
+    white_lin = 1.0          # 0 表示"不需要线性域削顶"（底片已是显示参考）
+    neutral_disp = None
     if engine in ("auto", "darktable") and dt_bin:
-        dt_out = os.path.join(d, "dt_base.jpg")
-        if darktable_develop(path, dt_out, 0, dt_bin, dt_style):
-            neutral_disp = load_display(dt_out)
-            used_engine = "darktable"
-            sigma = estimate_noise(to_linear(neutral_disp)) * 0.55
-        else:
-            neutral_disp = None
-    else:
-        neutral_disp = None
+        tmp = os.path.join(tempfile.gettempdir(), f"xphoto_{name}_{os.getpid()}.jpg")
+        try:
+            if darktable_develop(path, tmp, 0, dt_bin, dt_style):
+                neutral_disp = load_display(tmp)
+                used_engine = "darktable"
+                white_lin = 0.0
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
 
     if neutral_disp is None:
         lin, gain = normalize_white(decode_raw(path))
@@ -685,6 +685,10 @@ def process_one(args: Tuple[str, str, int, int, str, Optional[str], Optional[str
         except (IndexError, ValueError):
             white_lin = 1.0
         white_lin = clamp(white_lin, 0.2, 8.0)
+        del lin
+    else:
+        # darktable 已用相机噪声配置文件降过噪，这里的噪声只是残差，用来定去噪强度
+        sigma = estimate_noise(to_linear(neutral_disp)) * 0.55
 
     st = scene_stats(neutral_disp)
 
@@ -693,30 +697,24 @@ def process_one(args: Tuple[str, str, int, int, str, Optional[str], Optional[str
     except (TypeError, ValueError):
         iso = 0.0
 
-    base = auto_balance(st)
-    base.update(auto_detail(sigma, iso))
+    params = auto_balance(st)
+    params.update(auto_detail(sigma, iso))
     if used_engine == "darktable":
-        # darktable 已经用相机噪声配置文件做过降噪，这边只需补一点
-        base["denoise"] = round(clamp(base["denoise"] * 0.35, 0.0, 30.0), 1)
-    presets = preset_variants(base)
-    natural = presets["natural"]
+        params = soften_for_develop(params)
 
-    full = render(neutral_disp, natural, sigma, white_lin)
-    preview_in = resize_long_edge(neutral_disp, preview_size)
-    neutral_prev = preview_in
-    auto_prev = resize_long_edge(full, preview_size)
+    final = render(neutral_disp, params, sigma, white_lin)
+    del neutral_disp
 
-    save_jpeg(neutral_prev, os.path.join(d, "neutral.jpg"), 90)
-    save_jpeg(auto_prev, os.path.join(d, "auto.jpg"), 90)
-    save_jpeg(resize_long_edge(full, thumb_size), os.path.join(d, "thumb.jpg"), 84)
-    save_jpeg(full, os.path.join(d, "full.jpg"), 93)
-
-    after_stats = scene_stats(auto_prev)
-    h, w = full.shape[:2]
+    save_jpeg(final, out_path, quality)
+    after_stats = scene_stats(resize_long_edge(final, 900))
+    preview = preview_data_uri(final)
+    h, w = final.shape[:2]
+    del final
 
     meta = {
         "id": name,
         "file": os.path.basename(path),
+        "path": f"{os.path.basename(out_root)}/{name}.jpg",
         "width": w,
         "height": h,
         "engine": used_engine,
@@ -742,17 +740,11 @@ def process_one(args: Tuple[str, str, int, int, str, Optional[str], Optional[str
             "contrastBefore": round(st["p90"] - st["p10"], 3),
             "contrastAfter": round(after_stats["p90"] - after_stats["p10"], 3),
         },
-        "params": natural,
-        "presets": presets,
-        "paths": {
-            "neutral": f"{os.path.basename(out_root)}/{name}/neutral.jpg",
-            "auto": f"{os.path.basename(out_root)}/{name}/auto.jpg",
-            "thumb": f"{os.path.basename(out_root)}/{name}/thumb.jpg",
-            "full": f"{os.path.basename(out_root)}/{name}/full.jpg",
-        },
+        "params": params,        # 已烘焙进 jpg 的自动参数，网页端只用来展示
+        "preview": preview,      # 小图 data URI，相册/胶片条直接用
         "procMs": int((time.time() - t0) * 1000),
     }
-    print(f"  ✓ {name}  {w}x{h}  ISO{int(iso)}  噪声σ={sigma:.4f}  去噪{natural['denoise']:.0f}  "
+    print(f"  ✓ {name}  {w}x{h}  ISO{int(iso)}  噪声σ={sigma:.4f}  去噪{params['denoise']:.0f}  "
           f"{meta['procMs']}ms", flush=True)
     return meta
 
@@ -766,13 +758,13 @@ RAW_EXT = {".arw", ".srf", ".sr2", ".cr2", ".cr3", ".nef", ".dng", ".raf", ".orf
 def main() -> int:
     ap = argparse.ArgumentParser(description="RAW 自动修图流水线")
     ap.add_argument("--input", default="data", help="RAW 目录")
-    ap.add_argument("--output", default="out", help="输出目录")
-    ap.add_argument("--preview", type=int, default=2200, help="网页预览长边")
-    ap.add_argument("--thumb", type=int, default=560, help="缩略图长边")
+    ap.add_argument("--output", default="out", help="输出目录（平铺，每张 RAW 一个同名 jpg）")
+    ap.add_argument("--quality", type=int, default=93, help="成品 JPEG 质量")
     ap.add_argument("--jobs", type=int, default=min(4, (os.cpu_count() or 2)), help="并行进程数")
     ap.add_argument("--limit", type=int, default=0, help="只处理前 N 张（调试用）")
-    ap.add_argument("--engine", choices=["auto", "native", "darktable"], default="auto",
-                    help="显影引擎：auto=有 darktable 就用，native=自带流，darktable=强制")
+    ap.add_argument("--engine", choices=["darktable", "auto", "native"], default="darktable",
+                    help="显影引擎：darktable=用 darktable 显影（默认），auto=有就用、没有就回退，"
+                         "native=纯自带线性解码")
     ap.add_argument("--darktable", default=None, help="darktable-cli 路径（默认自动查找）")
     ap.add_argument("--dt-style", default=None, help="传给 darktable-cli 的 --style 名称")
     a = ap.parse_args()
@@ -782,14 +774,15 @@ def main() -> int:
         return 1
 
     dt_bin = find_darktable(a.darktable)
-    if a.engine == "darktable" and not dt_bin:
-        print("指定了 --engine darktable，但没找到 darktable-cli。\n"
-              "  装一个：sudo apt install darktable   （或 snap install darktable）\n"
-              "  或用 --darktable /path/to/darktable-cli 指定路径", file=sys.stderr)
-        return 1
-    if a.engine == "auto" and not dt_bin:
-        print("未检测到 darktable-cli，使用自带显影引擎（native）。\n"
-              "  想用 darktable 显影：sudo apt install darktable 后重跑，或 --engine darktable")
+    engine = a.engine
+    if not dt_bin:
+        if engine == "darktable":
+            print("没找到 darktable-cli，自动回退到自带显影引擎（native）。\n"
+                  "  装一个：sudo apt install darktable\n"
+                  "  或用 --darktable /path/to/darktable-cli 指定路径\n")
+        engine = "native"
+    elif engine == "auto":
+        engine = "darktable"
 
     files = sorted(
         os.path.join(a.input, f) for f in os.listdir(a.input)
@@ -802,11 +795,10 @@ def main() -> int:
         return 1
 
     os.makedirs(a.output, exist_ok=True)
-    eng = a.engine if (a.engine != "auto" or dt_bin) else "native"
     print(f"发现 {len(files)} 个 RAW，开始处理 → {a.output}/  "
-          f"[引擎: {eng}{' @ ' + dt_bin if eng == 'darktable' else ''}]")
+          f"[引擎: {engine}{' @ ' + dt_bin if engine == 'darktable' else ''}]")
     t0 = time.time()
-    tasks = [(f, a.output, a.preview, a.thumb, a.engine, dt_bin, a.dt_style) for f in files]
+    tasks = [(f, a.output, engine, dt_bin, a.dt_style, a.quality) for f in files]
     # rawpy 内部启用 OpenMP，必须用 spawn/forkserver 避免死锁
     import multiprocessing as mp
     ctx = mp.get_context("spawn")
@@ -817,10 +809,9 @@ def main() -> int:
     manifest = {
         "generatedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
         "source": a.input,
-        "version": 2,
+        "version": 3,
         "engine": used[0] if len(used) == 1 else "mixed",
         "darktable": dt_bin if "darktable" in used else None,
-        "presetOrder": ["natural", "vivid", "film"],
         "paramKeys": PARAM_KEYS,
         "paramRange": {k: list(v) for k, v in PARAM_RANGE.items()},
         "processMs": int((time.time() - t0) * 1000),

@@ -40,15 +40,14 @@
       <p id="gallerySub">自动分析场景 → 曝光与白平衡校正 → 分级降噪 → 通透感与锐化</p>
     </div>
     <div class="legend">
-      <span class="dot auto"></span> 自动修图
-      <span class="dot raw"></span> RAW 原片
+      <span class="dot auto"></span> darktable 显影 + 自动调色
     </div>
   </div>
 
   <main class="grid" id="grid"></main>
 
   <footer class="foot">
-    <span>点击任意照片进入编辑器 · 可实时调节参数、拖动分割线对比原片、导出 JPEG</span>
+    <span>点击任意照片进入编辑器 · 可实时追加调整、拖动分割线对比自动成品、导出 JPEG</span>
   </footer>
 </div>
 
@@ -63,7 +62,7 @@
       <div class="chips" id="edExif"></div>
     </div>
     <div class="ed-actions">
-      <button class="btn ghost" id="btnHold" title="按住查看 RAW 原片 (空格)">
+      <button class="btn ghost" id="btnHold" title="按住查看自动成品 (空格)">
         <svg viewBox="0 0 24 24" width="15" height="15"><path d="M2 12s3.6-6.5 10-6.5S22 12 22 12s-3.6 6.5-10 6.5S2 12 2 12z" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="12" cy="12" r="2.6" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>
         对比
       </button>
@@ -79,15 +78,15 @@
     <div class="stage" id="stage">
       <canvas id="gl"></canvas>
       <div class="split-line" id="splitLine"><i></i></div>
-      <div class="stage-tag left" id="tagBefore">RAW 原片</div>
-      <div class="stage-tag right" id="tagAfter">自动修图</div>
+      <div class="stage-tag left" id="tagBefore">自动成品</div>
+      <div class="stage-tag right" id="tagAfter">当前调整</div>
       <div class="zoom-bar">
         <button id="btnZoomOut" title="缩小">−</button>
         <span id="zoomLabel">适合</span>
         <button id="btnZoomIn" title="放大">+</button>
         <button id="btnZoomFit" title="适合窗口 (0)">适合</button>
       </div>
-      <div class="stage-hint" id="stageHint">拖动分割线对比 · 滚轮缩放 · 双击复位</div>
+      <div class="stage-hint" id="stageHint">调整右侧参数后，拖动分割线可与自动成品对比</div>
     </div>
 
     <aside class="panel">
@@ -104,10 +103,17 @@
       </div>
 
       <div class="p-sec">
+        <h3>已烘焙的自动参数</h3>
+        <div class="baked" id="baked"></div>
+        <p class="tiny">这些参数已由 Python 端应用并写进 <code>out/&lt;id&gt;.jpg</code>，
+          上面的滑块是在成品之上的追加调整。</p>
+      </div>
+
+      <div class="p-sec">
         <h3>导出</h3>
         <button class="btn wide" id="btnExportBig">导出当前效果 · JPG</button>
-        <a class="btn wide ghost" id="lnkFull" href="#" download>下载全分辨率自动图</a>
-        <p class="tiny">全分辨率文件由 Python 端导出（长边 3936px, q93）。</p>
+        <a class="btn wide ghost" id="lnkFull" href="#" download>下载全分辨率成品</a>
+        <p class="tiny">成品由 darktable 显影 + xPhoto 自动调色导出（长边 3968px, q93）。</p>
       </div>
     </aside>
   </div>

@@ -47,19 +47,31 @@
     },
   ];
 
-  const PRESET_META = {
-    natural: { name: '自然', desc: '默认推荐' },
-    vivid: { name: '通透', desc: '高对比' },
-    film: { name: '胶片', desc: '低反差' },
+  /* 底座已经是 Python 端烘焙好的成品（out/<id>.jpg），所以这里的预设是
+     「在自动结果之上再推一把」的增量；全零 = 原封不动的自动成品。 */
+  const PRESETS = {
+    base: { name: '原味', desc: '自动成品', p: {} },
+    clear: {
+      name: '通透', desc: '层次 +',
+      p: { contrast: 8, shadows: 8, highlights: -6, midtone: 6, vibrance: 14, clarity: 18 },
+    },
+    film: {
+      name: '胶片', desc: '柔高光',
+      p: {
+        contrast: -10, shadows: 14, highlights: -12, saturation: -8, vibrance: -4,
+        temp: 4, shadowTint: -8, highlightTint: 6,
+      },
+    },
   };
+  const PRESET_ORDER = ['base', 'clear', 'film'];
 
   /* ---------------- 状态 ---------------- */
   const state = {
     manifest: null,
     images: [],
     idx: 0,
-    params: {},
-    presetKey: 'natural',
+    params: { ...PRESETS.base.p },
+    presetKey: 'base',
     zoom: 1,
     panX: 0,
     panY: 0,
@@ -371,16 +383,21 @@
 
     ctx.drawArrays(ctx.TRIANGLE_STRIP, 0, 4);
 
-    // 分割线位置
+    // 分割线：参数全零时两边是同一张图，线就没意义，先藏起来
+    const neutral = isNeutral(p);
     const line = $('#splitLine');
-    if (state.before || state.split < 0) {
+    if (state.before || state.split < 0 || neutral) {
       line.classList.add('hidden');
     } else {
       line.classList.remove('hidden');
       line.style.left = (r.x + r.w * state.split) + 'px';
     }
-    $('#tagBefore').classList.toggle('dim', !state.before && state.split < 0);
+    $('#tagBefore').classList.toggle('dim', state.before || neutral);
     $('#tagAfter').classList.toggle('dim', state.before);
+  }
+
+  function isNeutral(p) {
+    return GROUP.every((g) => g.items.every((it) => Math.abs(p[it.k] || 0) < 0.005));
   }
 
   function requestRender() {
@@ -406,13 +423,13 @@
     if (fallbackImg) { fallbackImg.remove(); fallbackImg = null; }
 
     const img = currentImage();
-    state.presetKey = 'natural';
-    state.params = { ...img.presets.natural };
+    state.presetKey = 'base';
+    state.params = { ...PRESETS.base.p };
 
     $('#gallery').classList.add('hidden');
     $('#editor').classList.remove('hidden');
     $('#edName').textContent = `${img.id}`;
-    $('#lnkFull').href = img.paths.full;
+    $('#lnkFull').href = img.path;
 
     const e = img.exif;
     const chips = [
@@ -421,8 +438,8 @@
       e.iso ? `ISO ${e.iso}` : null, e.shutter, e.aperture, e.focal,
     ].filter(Boolean);
     $('#edExif').innerHTML = chips.map((c) => `<span>${c}</span>`).join('');
-    $('#tagBefore').textContent = img.engine === 'darktable' ? 'darktable 默认显影' : 'RAW 原片';
-    $('#tagAfter').textContent = 'xPhoto 修图';
+    $('#tagBefore').textContent = '自动成品';
+    $('#tagAfter').textContent = '当前调整';
 
     buildPresets();
     buildSliders();
@@ -434,7 +451,7 @@
     const tex = new Image();
     tex.onload = () => {
       if (!state.glOk) {
-        showFallback(img.paths.auto);
+        showFallback(img.path);
         return;
       }
       try {
@@ -445,11 +462,11 @@
       } catch (e) {
         console.error(e);
         state.glOk = false;
-        showFallback(img.paths.auto);
+        showFallback(img.path);
       }
       setTimeout(() => $('#stageHint').classList.add('fade'), 3200);
     };
-    tex.src = img.paths.neutral;
+    tex.src = img.path;
     try { history.replaceState(null, '', '#' + img.id); } catch (e) { /* file:// 下忽略 */ }
   }
 
@@ -475,11 +492,10 @@
   }
 
   function buildPresets() {
-    const img = currentImage();
     const box = $('#presets');
     box.innerHTML = '';
-    (state.manifest.presetOrder || ['natural', 'vivid', 'film']).forEach((k) => {
-      const meta = PRESET_META[k] || { name: k, desc: '' };
+    PRESET_ORDER.forEach((k) => {
+      const meta = PRESETS[k];
       const b = document.createElement('button');
       b.className = 'preset' + (state.presetKey === k ? ' on' : '');
       b.dataset.k = k;
@@ -490,9 +506,9 @@
   }
 
   function applyPreset(k) {
-    const img = currentImage();
+    if (!PRESETS[k]) return;
     state.presetKey = k;
-    state.params = { ...img.presets[k] };
+    state.params = { ...PRESETS[k].p };
     document.querySelectorAll('.preset').forEach((b) => b.classList.toggle('on', b.dataset.k === k));
     syncControls();
     requestRender();
@@ -563,11 +579,11 @@
   }
 
   function markDirty() { /* 预设高亮：与预设不同则取消高亮 */
-    const img = currentImage();
     let match = null;
-    for (const k of Object.keys(img.presets)) {
-      const pr = img.presets[k];
-      const same = Object.keys(pr).every((kk) => Math.abs((pr[kk] || 0) - (state.params[kk] || 0)) < 0.02);
+    for (const k of PRESET_ORDER) {
+      const pr = PRESETS[k].p;
+      const keys = new Set([...Object.keys(pr), ...Object.keys(state.params)]);
+      const same = [...keys].every((kk) => Math.abs((pr[kk] || 0) - (state.params[kk] || 0)) < 0.02);
       if (same) { match = k; break; }
     }
     state.presetKey = match;
@@ -587,6 +603,16 @@
     $('#analysis').innerHTML = rows.map(
       ([k, v]) => `<div><div class="stat-k">${k}</div><div class="stat-v">${v}</div></div>`
     ).join('');
+
+    const p = currentImage().params || {};
+    const list = GROUP.flatMap((g) => g.items)
+      .filter((it) => Math.abs(p[it.k] || 0) > 0.005)
+      .map((it) => {
+        const v = p[it.k];
+        const sign = v > 0 ? '+' : '';
+        return `<span><i>${it.label}</i>${sign}${v.toFixed(it.dec)}${it.unit || ''}</span>`;
+      });
+    $('#baked').innerHTML = list.length ? list.join('') : '<span class="muted">这张没有任何需要调整的项</span>';
   }
 
   function buildFilmstrip() {
@@ -595,7 +621,7 @@
     state.images.forEach((img, i) => {
       const d = document.createElement('button');
       d.className = 'film' + (i === state.idx ? ' on' : '');
-      d.innerHTML = `<img src="${img.paths.thumb}" alt="${img.id}" loading="lazy">`;
+      d.innerHTML = `<img src="${img.preview || img.path}" alt="${img.id}" loading="lazy">`;
       d.onclick = () => openEditor(i);
       box.appendChild(d);
     });
@@ -705,7 +731,7 @@
 
   function bindEditor() {
     $('#btnBack').onclick = closeEditor;
-    $('#btnReset').onclick = () => { applyPreset('natural'); toast('已恢复自动参数'); };
+    $('#btnReset').onclick = () => { applyPreset('base'); toast('已回到自动成品'); };
     $('#btnExport').onclick = exportCurrent;
     $('#btnExportBig').onclick = exportCurrent;
 
@@ -717,7 +743,7 @@
       else if (e.key === 'ArrowRight') { e.preventDefault(); openEditor(state.idx + 1); }
       else if (e.key === 'ArrowLeft') { e.preventDefault(); openEditor(state.idx - 1); }
       else if (e.key === '0') { setZoom(1); }
-      else if (e.key.toLowerCase() === 'r') applyPreset('natural');
+      else if (e.key.toLowerCase() === 'r') applyPreset('base');
       else if (e.key.toLowerCase() === 'e') exportCurrent();
       else if (e.key === ' ') { e.preventDefault(); state.before = true; requestRender(); }
     });
@@ -801,7 +827,7 @@
       const e = img.exif;
       card.innerHTML = `
         <div class="card-img">
-          <img src="${img.paths.thumb}" alt="${img.id}" loading="lazy">
+          <img src="${img.preview || img.path}" alt="${img.id}" loading="lazy">
           <div class="card-chip">
             <span class="chip-mini on">自动</span>
             ${e.iso ? `<span class="chip-mini">ISO ${e.iso}</span>` : ''}
@@ -849,7 +875,7 @@
     const i = state.images.findIndex((x) => x.id === id);
     if (i < 0) return false;
     openEditor(i);
-    if (preset && currentImage().presets[preset]) applyPreset(preset);
+    if (preset && PRESETS[preset]) applyPreset(preset);
     return true;
   }
 
